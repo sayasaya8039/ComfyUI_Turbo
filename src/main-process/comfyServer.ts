@@ -16,6 +16,37 @@ import { rotateLogFiles } from '../utils';
 import { VirtualEnvironment } from '../virtualEnvironment';
 import { AppWindow } from './appWindow';
 
+/** Throttle IPC log messages to reduce renderer overhead */
+class LogThrottle {
+  private buffer: string[] = [];
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  constructor(
+    private readonly flush: (msg: string) => void,
+    private readonly intervalMs = 16 // ~60fps
+  ) {}
+
+  push(data: string) {
+    this.buffer.push(data);
+    if (!this.timer) {
+      this.timer = setTimeout(() => {
+        const batch = this.buffer.join('');
+        this.buffer = [];
+        this.timer = null;
+        this.flush(batch);
+      }, this.intervalMs);
+    }
+  }
+
+  drain() {
+    if (this.timer) clearTimeout(this.timer);
+    if (this.buffer.length > 0) {
+      this.flush(this.buffer.join(''));
+      this.buffer = [];
+    }
+    this.timer = null;
+  }
+}
+
 /** Known server start errors. */
 type ServerStartError = 'ModuleNotFoundError';
 
@@ -158,8 +189,11 @@ export class ComfyServer implements HasTelemetry {
     }
 
     ComfySettings.lockWrites();
-    await ComfyServerConfig.addAppBundledCustomNodesToConfig();
-    await rotateLogFiles(app.getPath('logs'), LogFile.ComfyUI, 50);
+    // Run config and log rotation in parallel (neither blocks server start)
+    await Promise.all([
+      ComfyServerConfig.addAppBundledCustomNodesToConfig(),
+      rotateLogFiles(app.getPath('logs'), LogFile.ComfyUI, 50),
+    ]);
     return new Promise<void>((resolve, reject) => {
       const comfyUILog = log.create({ logId: 'comfyui' });
       comfyUILog.transports.file.fileName = LogFile.ComfyUI;
@@ -167,6 +201,11 @@ export class ComfyServer implements HasTelemetry {
       comfyUILog.transports.file.transforms.unshift(removeAnsiCodesTransform);
 
       this.timedOutWhilstStarting = false;
+
+      // Throttle IPC log messages to ~60fps batches
+      const logThrottle = new LogThrottle((msg) => {
+        this.appWindow.send(IPC_CHANNELS.LOG_MESSAGE, msg);
+      });
 
       let comfyServerProcess: ChildProcess;
 
@@ -184,24 +223,24 @@ export class ComfyServer implements HasTelemetry {
         log.info(`Frontend root: ${this.webRootPath}`);
         comfyServerProcess.stdout?.on('data', (data: Buffer) => {
           comfyUILog.info(data.toString());
-          this.appWindow.send(IPC_CHANNELS.LOG_MESSAGE, data.toString());
+          logThrottle.push(data.toString());
         });
         comfyServerProcess.stderr?.on('data', (data: Buffer) => {
           comfyUILog.error(data.toString());
           this.lastStdErr = data.toString();
-          this.appWindow.send(IPC_CHANNELS.LOG_MESSAGE, data.toString());
+          logThrottle.push(data.toString());
         });
       } else {
         // Python mode: use virtual environment
         comfyServerProcess = this.virtualEnvironment.runPythonCommand(this.launchArgs, {
           onStdout: (data) => {
             comfyUILog.info(data);
-            this.appWindow.send(IPC_CHANNELS.LOG_MESSAGE, data);
+            logThrottle.push(data);
           },
           onStderr: (data) => {
             comfyUILog.error(data);
             this.lastStdErr = data;
-            this.appWindow.send(IPC_CHANNELS.LOG_MESSAGE, data);
+            logThrottle.push(data);
           },
         });
       }
@@ -229,7 +268,7 @@ export class ComfyServer implements HasTelemetry {
       waitOn({
         resources: [`${this.baseUrl}/queue`],
         timeout: ComfyServer.MAX_FAIL_WAIT,
-        interval: ComfyServer.CHECK_INTERVAL,
+        interval: this.useTurboEngine ? 100 : ComfyServer.CHECK_INTERVAL, // Turbo: 100ms, Python: 1s
       })
         .then(() => {
           log.info(this.useTurboEngine ? 'Turbo Engine is ready' : 'Python server is ready');
