@@ -8,6 +8,7 @@ const debugConfig: Configuration = {
     { from: './assets/UI', to: 'UI' },
     { from: './assets/desktop-ui', to: 'desktop-ui' },
     { from: './assets/comfy-server.exe', to: 'comfy-server.exe' },
+    { from: './assets/julia', to: 'julia' },
   ],
   beforeBuild: './scripts/preMake.js',
   win: {
