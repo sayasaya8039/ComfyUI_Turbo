@@ -13,8 +13,17 @@ const debugConfig: Configuration = {
   beforeBuild: './scripts/preMake.js',
   win: {
     icon: './assets/UI/Comfy_Logo.ico',
-    target: 'zip',
+    target: ['nsis', 'zip'],
     signtoolOptions: null,
+  },
+  nsis: {
+    oneClick: false,
+    perMachine: false,
+    allowToChangeInstallationDirectory: true,
+    installerIcon: './assets/UI/Comfy_Logo.ico',
+    uninstallerIcon: './assets/UI/Comfy_Logo.ico',
+    installerHeaderIcon: './assets/UI/Comfy_Logo.ico',
+    artifactName: 'ComfyUI-Turbo-${version}-setup.${ext}',
   },
   mac: {
     icon: './assets/UI/Comfy_Logo.icns',
