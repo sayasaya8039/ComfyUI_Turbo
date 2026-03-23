@@ -212,15 +212,18 @@ export class ComfyServer implements HasTelemetry {
       if (this.useTurboEngine) {
         // Turbo Engine: spawn comfy-server.exe directly (no Python needed)
         log.info(`Using Turbo Engine: ${this.turboEnginePath}`);
+        const venvPath = path.join(this.basePath, '.venv');
         comfyServerProcess = spawn(this.turboEnginePath, [], {
           cwd: this.basePath,
           env: {
             ...process.env,
             COMFY_PORT: this.serverArgs.port,
             COMFY_FRONTEND: this.webRootPath,
+            COMFY_VENV: venvPath,
           },
         });
         log.info(`Frontend root: ${this.webRootPath}`);
+        log.info(`Venv path: ${venvPath}`);
         comfyServerProcess.stdout?.on('data', (data: Buffer) => {
           comfyUILog.info(data.toString());
           logThrottle.push(data.toString());

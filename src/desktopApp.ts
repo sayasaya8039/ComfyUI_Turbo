@@ -22,6 +22,7 @@ import { useAppState } from './main-process/appState';
 import { AppWindow } from './main-process/appWindow';
 import { ComfyDesktopApp } from './main-process/comfyDesktopApp';
 import type { ComfyInstallation } from './main-process/comfyInstallation';
+import { ComfyServer } from './main-process/comfyServer';
 import { DevOverrides } from './main-process/devOverrides';
 import { createInstallStageInfo } from './main-process/installStages';
 import SentryLogging from './services/sentry';
@@ -117,10 +118,41 @@ export class DesktopApp implements HasTelemetry {
         return;
       }
 
-      // Start server
+      // Hybrid mode: Turbo Engine starts fast, Python takes over when ready
       try {
         await startComfyServer(comfyDesktopApp, serverArgs);
         await loadFrontend(serverArgs);
+
+        // Check if Turbo Engine was used (check AFTER server started)
+        const usedTurbo = comfyDesktopApp.comfyServer?.useTurboEngine ?? false;
+        if (usedTurbo) {
+          const pythonPort = String(Number(serverArgs.port) + 1);
+          log.info(`Hybrid mode: starting Python server on port ${pythonPort} in background`);
+          const pythonArgs: ServerArgs = { ...serverArgs, port: pythonPort };
+          const pythonServer = new ComfyServer(
+            comfyDesktopApp.basePath,
+            pythonArgs,
+            comfyDesktopApp.installation.virtualEnvironment,
+            appWindow,
+            telemetry
+          );
+          // Force Python mode by temporarily disabling Turbo Engine detection
+          const origPath = pythonServer.turboEnginePath;
+          Object.defineProperty(pythonServer, 'useTurboEngine', { get: () => false });
+          pythonServer
+            .start()
+            .then(async () => {
+              log.info(`Python server ready on port ${pythonPort}, switching frontend`);
+              await appWindow.loadComfyUI(pythonArgs);
+              // Kill Turbo Engine
+              await comfyDesktopApp.comfyServer?.kill();
+              comfyDesktopApp.comfyServer = pythonServer;
+              log.info('Switched to Python server (full functionality)');
+            })
+            .catch((err) => {
+              log.warn(`Python background start failed, staying on Turbo Engine: ${err}`);
+            });
+        }
       } catch (error) {
         // If there is a module import error, offer to try and recreate the venv.
         const lastError = comfyDesktopApp.comfyServer?.parseLastError();
