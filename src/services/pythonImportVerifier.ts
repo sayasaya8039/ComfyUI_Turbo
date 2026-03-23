@@ -2,18 +2,73 @@ import log from 'electron-log/main';
 import Joi from 'joi';
 
 import type { ProcessCallbacks, PythonExecutor } from '../virtualEnvironment';
+import { JuliaEnvironment } from './juliaEnvironment';
 
 /** Result of Python import verification */
 export interface ImportVerificationResult {
   success: boolean;
   error?: string;
   missingImports?: string[];
+  verifiedBy?: 'julia' | 'python';
 }
 
 /** List of failed imports reported by the Python script */
 interface PythonValidationResult {
   success: boolean;
   failed_imports: string[];
+}
+
+/** Julia verify_deps.jl の出力型 */
+interface JuliaVerificationResult {
+  success: boolean;
+  failed_imports: string[];
+  gpu_info?: Record<string, unknown>;
+  system_info?: Record<string, unknown>;
+  timestamp?: string;
+}
+
+/**
+ * Julia で依存関係を検証する（Python フォールバック前に試行）
+ */
+async function runJuliaImportVerifyScript(
+  importsToCheck: string[],
+  venvPath?: string
+): Promise<ImportVerificationResult | null> {
+  const julia = JuliaEnvironment.getInstance();
+
+  if (!(await julia.isAvailable())) {
+    log.debug('Julia not available, falling back to Python verification');
+    return null;
+  }
+
+  log.info(`Verifying imports via Julia - testing ${importsToCheck.length} modules`);
+
+  const args = ['--modules', importsToCheck.join(','), '--check-gpu', '--check-system'];
+  if (venvPath) {
+    args.push('--venv', venvPath);
+  }
+
+  const result = await julia.runScriptJSON<JuliaVerificationResult>('verify_deps.jl', args);
+
+  if (!result.success || !result.data) {
+    log.warn('Julia verification failed, will fall back to Python:', result.error);
+    return null;
+  }
+
+  const { data } = result;
+
+  if (data.success) {
+    log.info('Julia import verification successful - all modules available');
+    return { success: true, verifiedBy: 'julia' };
+  }
+
+  log.error(`Julia import verification failed - missing modules: ${data.failed_imports.join(', ')}`);
+  return {
+    success: false,
+    missingImports: data.failed_imports,
+    error: `Missing imports: ${data.failed_imports.join(', ')}`,
+    verifiedBy: 'julia',
+  };
 }
 
 /**
@@ -78,20 +133,29 @@ function interpretPythonValidationOutput(
 
 /**
  * Verifies that specified Python packages can be successfully imported.
- * This helps detect partial installations where package managers may have failed silently.
+ * Julia を優先的に使用し、利用不可の場合は Python にフォールバック。
  *
  * @param pythonEnv The virtual environment to use for verification
  * @param importsToCheck Array of Python module names to check
+ * @param venvPath Optional path to Python venv (for Julia to use)
  * @returns Verification result indicating success or list of missing imports
  */
 export async function runPythonImportVerifyScript(
   pythonEnv: PythonExecutor,
-  importsToCheck: string[]
+  importsToCheck: string[],
+  venvPath?: string
 ): Promise<ImportVerificationResult> {
   if (importsToCheck.length === 0) {
     return { success: true };
   }
 
+  // Julia で検証を試行（高速・追加情報付き）
+  const juliaResult = await runJuliaImportVerifyScript(importsToCheck, venvPath);
+  if (juliaResult !== null) {
+    return juliaResult;
+  }
+
+  // Python フォールバック
   log.info(`Verifying Python imports - testing ${importsToCheck.length} modules`);
 
   let output = '';
@@ -110,11 +174,11 @@ export async function runPythonImportVerifyScript(
     const interpretation = interpretPythonValidationOutput(output);
 
     if (interpretation.type === 'parse_error') {
-      // If we can't parse the output, return a generic error
       log.error('Failed to parse verification output:', output);
       return {
         success: false,
         error: `Python import verification failed with exit code ${exitCode}: ${output}`,
+        verifiedBy: 'python',
       };
     }
 
@@ -123,13 +187,14 @@ export async function runPythonImportVerifyScript(
       return {
         success: false,
         error: `Invalid verification output format: ${interpretation.message}`,
+        verifiedBy: 'python',
       };
     }
 
     const validatedOutput = interpretation.value;
     if (validatedOutput.success) {
       log.info('Python import verification successful - all modules available');
-      return { success: true };
+      return { success: true, verifiedBy: 'python' };
     }
 
     const failedImports = validatedOutput.failed_imports;
@@ -139,12 +204,14 @@ export async function runPythonImportVerifyScript(
       success: false,
       missingImports: failedImports,
       error: `Missing imports: ${failedImports.join(', ')}`,
+      verifiedBy: 'python',
     };
   } catch (error) {
     log.error('Error during Python import verification:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown verification error',
+      verifiedBy: 'python',
     };
   }
 }
